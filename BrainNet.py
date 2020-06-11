@@ -8,7 +8,7 @@ class BrainNet(nn.Module):
     # m = # of labels/classes
     # num_v = number of verices in graph
     # p = prob. of an edge in graph
-    def __init__(self, n, m, num_v, p, cap, rounds, gd_output_only = False, gd_input = True, gd_output = False):
+    def __init__(self, n, m, num_v, p, cap, rounds, gd_input = False, gd_output = False):
         super().__init__()
 
         self.cap = cap
