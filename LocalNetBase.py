@@ -6,203 +6,159 @@ from sklearn.utils import shuffle
 from BrainNet import BrainNet
 
 class Options: 
-    def __init__(self, 
-                 num_graphs = 1, 
-                 rule = None, 
-                 use_input_rule = False,
-                 use_bias_rule = False, 
-                 use_output_rule = False,
-                 gd_graph_rule = True,
-                 gd_output_rule = False,
-                 additive_rule = True):
-        self.rule = rule
-        self.num_graphs = num_graphs
+    def __init__(
+            self, 
+            use_input_rule = False,
+            use_output_rule = False,
+            use_graph_rule = False, 
+            gd_graph_rule = False,
+            gd_output_rule = False,
+            gd_input = False,
+            gd_output = False,
+            additive_rule = True):
+        self.gd_output = gd_output
+        self.gd_input = gd_input
+        self.use_graph_rule = use_graph_rule 
         self.use_input_rule = use_input_rule
-        self.use_bias_rule = use_bias_rule
         self.gd_graph_rule = gd_graph_rule 
         self.use_output_rule = use_output_rule
         self.gd_output_rule = gd_output_rule
         self.additive_rule = additive_rule
     
+class UpdateScheme: 
+    def __init__(
+            self, 
+            cross_entropy_loss = True, 
+            mse_loss = False, 
+            update_misclassified = True, 
+            update_all_edges = False):
+        self.cross_entropy_loss = cross_entropy_loss 
+        self.mse_loss = mse_loss 
+        self.update_misclassified = update_misclassified 
+        self.update_all_edges = update_all_edges
 
-# do not instantiate this class directly. Use something from the BrainNetVariants file. ex. LocalNet.
-class LocalNetBase(nn.Module):
+# do not instantiate this class directly. Use something from the network.py file. ex. LocalNet.
+class LocalNetBase(BrainNet):
     '''
         n = # of features
         m = # of possible labels
         num_v = # of nodes in graph
         p = probability that an edge exists in the graph
         cap = choose top 'cap' nodes which fire
-        rounds = # of times the graph 'fires'
-        num_graphs = # of graphs we train on. Same rule across all graphs, but separate GD on input layer
-        rules: if None, we apply GD on rule and on input layer. 
-                If rules is specified, we use that fixed rule, and only run GD on input layer
-        use_bias_rule/use_output_rule: True/False whether to update network bias and output weights with a fixed rule. 
-                If False, bias remains 0, and output weights are all equal to 1.
-            
+        rounds = # of times the graph 'fires'           
     '''
-    def __init__(self, n, m, num_v, p, cap, rounds, options = Options()):
-        super().__init__()
-        self.cap = cap
-        self.rounds = rounds
+    def __init__(self, n, m, num_v, p, cap, rounds, options = Options(), update_scheme = UpdateScheme()):
+        super().__init__(   n = n, 
+                            m = m, 
+                            num_v = num_v, 
+                            p = p, 
+                            cap = cap, 
+                            rounds = rounds, 
+                            gd_input = options.gd_input, 
+                            gd_output = options.gd_output)
 
-        self.n = n
-        self.m = m
-        self.p = p
-        self.num_v = num_v
         self.options = options
+        self.update_scheme = update_scheme
         
-        self.cur_batch = 0
-        
-        self.accuracies = []
-        
-        self.network = []
-        for _ in range(self.options.num_graphs):
-            self.network.append(BrainNet(n, 
-                                         m, 
-                                         num_v = num_v, 
-                                         p = p, 
-                                         cap = cap, 
-                                         rounds = rounds, 
-                                         input_rule = options.use_input_rule))
-        
+        self.single_rules = torch.randn((rounds, 4))
+
         self.rule = torch.randn((2**(rounds+1))**2)
-        self.bias_rule = torch.randn(2**(rounds + 1))
         self.input_rule = torch.randn(2**(rounds + 1))
         self.output_rule = torch.zeros((2**(rounds + 1)) * 2)
         self.step_sz = 0.01
 
-    def copy_rule(self, net): 
-        self.rule = net.rule.data
-        self.bias_rule = net.rule.bias_rule.data
-        if self.options.use_input_rule:
-            self.input_rule = net.rule.input_rule.data
+    def get_rnn_rule(self): 
+        return self.rule.clone().detach().view(2 ** (self.rounds + 1), 2 ** (self.rounds + 1))
+    
+    def get_output_rule(self): 
+        return self.output_rule.clone().detach().view(2 ** (self.rounds + 1), 2)
 
+    def set_rnn_rule(self, rule):
+        self.rule = torch.tensor(rule).flatten().double()
+
+    def set_output_rule(self, rule): 
+        self.output_rule = rule.clone().detach().flatten().double()
 
     def copy_graph(self, net, input_layer = False, graph = False, output_layer = False):
         if input_layer: 
-            self.network[0].input_layer = net.network[0].input_layer
+            self.input_layer = net.input_layer
         if graph:
-            self.network[0].graph = net.network[0].graph
+            self.graph = net.graph
         if output_layer: 
-            self.network[0].output_layer = net.network[0].output_layer
+            self.output_layer = net.output_layer
             
-    '''
-        Given input 'x' and corresponding correct label 'label'.
-        Updates weights of each graph 
-    '''
     def update_weights(self, probs, label):
-        for i in range(self.options.num_graphs):
-            prob = probs[i][0]
-            prediction = torch.argmax(prob)
-            
-            if prediction != label: 
-                output_rule = self.output_rule
-            else:
-=               return
+        prob = probs[0]
+        prediction = torch.argmax(prob)
 
-            a1 = self.network[i].activated.repeat(1,self.num_v).view(-1, self.num_v)
-            a2 = self.network[i].activated.view(-1, 1).repeat(1, self.num_v).view(self.num_v, self.num_v)
+        if self.update_scheme.update_misclassified and prediction == label: 
+            return 
+
+        def mult(a, b): 
+            a *= 1 + self.step_sz * b
+        def add(a, b): 
+            a += self.step_sz * b
+
+        if self.options.additive_rule:
+            update_func = add 
+        else: 
+            update_func = mult 
+
+
+        # update graph weights
+        if self.options.use_graph_rule: 
+            a1 = self.activated.repeat(1,self.num_v).view(-1, self.num_v)
+            a2 = self.activated.view(-1, 1).repeat(1, self.num_v).view(self.num_v, self.num_v)
             act = (2 ** (self.rounds + 1)) * a1 + a2
                  
-            act *= self.network[i].graph
+            act *= self.graph
             act = act.long()
- 
-            # update graph weights
-            if self.options.additive_rule:
-                self.network[i].graph_weights += self.step_sz * self.rule[act]
-            else: 
-                self.network[i].graph_weights *= (1 + self.step_sz * self.rule[act])
 
-            # update input weights 
-            if self.options.use_input_rule:
-                input_act = self.network[i].activated.repeat(1, self.n).view(-1, self.n)
-                input_act *= self.network[i].input_layer
-                input_act = input_act.long() 
+            update_func(self.graph_weights, self.rule[act])
 
-                self.network[i].input_weights += self.step_sz * self.input_rule[input_act]
+        # update input weights 
+        if self.options.use_input_rule:
+            input_act = self.activated.repeat(1, self.n).view(-1, self.n)
+            input_act *= self.input_layer
+            input_act = input_act.long() 
 
-            # update bias                 
-            if self.options.use_bias_rule:
-                if self.options.additive_rule:
-                    self.network[i].graph_bias += self.step_sz * self.bias_rule[self.network[i].activated.long()]
-                else: 
-                    self.network[i].graph_bias *= (1 + self.step_sz * self.bias_rule[self.network[i].activated.long()])
+            update_func(self.input_weights, self.input_rule[input_act])
 
-            #update output weights
-            if self.options.use_output_rule:
-                if self.options.additive_rule:
-                    self.network[0].output_weights[1 - label] += self.step_sz * self.output_rule[2 * self.network[i].activated.long() + 1]
-                    self.network[0].output_weights[label] += self.step_sz * self.output_rule[2 * self.network[i].activated.long()]    
-                else: 
-                    self.network[0].output_weights[prediction] *= (1 + self.step_sz * self.output_rule[2 * self.network[i].activated.long() + 1])
-                    self.network[0].output_weights[label] *= (1 + self.step_sz * self.output_rule[2 * self.network[i].activated.long()])    
-    '''
-        Given training data X and labels y
-        Run for 'epochs'
-        For each x in X, update weights using current rule.
-        print error at each batch.
-    '''
+        #update output weights
+        if self.options.use_output_rule:
+            if self.update_scheme.update_all_edges:
+                update_func(self.output_weights[label], self.output_rule[2 * self.activated.long()])
+                for j in range(len(prob)):
+                    if j != label:
+                        update_func(self.output_weights[j], self.output_rule[2 * self.activated.long() + 1])
+            else:
+                update_func(self.output_weights[prediction], self.output_rule[2 * self.activated.long() + 1])
+                update_func(self.output_weights[label], self.output_rule[2 * self.activated.long()])
+
     def forward(self, inputs, labels, epochs, batch, continue_ = False):
         if continue_ == False:
-          for i in range(self.options.num_graphs):
-              self.network[i].reset_weights(additive = self.options.additive_rule, input_rule = self.options.use_input_rule, output_rule = self.options.use_output_rule)
-              self.network[i].double()
-        torch.set_printoptions(precision=3)
+            self.reset_weights(additive = self.options.additive_rule, input_rule = self.options.use_input_rule, output_rule = self.options.use_output_rule)
+            self.double()
 
-        sz = len(inputs)
-        num_batches = sz//batch
-
-        #criterion = nn.MSELoss()
-        criterion = nn.CrossEntropyLoss()
+        if self.update_scheme.mse_loss: 
+            criterion = nn.MSELoss()
+        elif self.update_scheme.cross_entropy_loss:
+            criterion = nn.CrossEntropyLoss()
 
         self.output_updates = torch.zeros(self.m, self.num_v)
         
-        running_loss = []
         for epoch in range(1, epochs + 1):
             for x,ell in zip(inputs,labels):
-                outputs = self.network[0](x.unsqueeze(0))
-                self.update_weights([outputs], ell)
+                outputs = self.forward_pass(x.unsqueeze(0))
+                self.update_weights(outputs, ell)       
+        outputs = self.forward_pass(inputs)
         
-        cur_losses = torch.zeros(self.options.num_graphs)
-        for i in range(self.options.num_graphs):
-            outputs = self.network[i](inputs)
-
-            # For MSE Loss
-            #target = torch.zeros_like(outputs)
-            #target = target.scatter_(1, labels.unsqueeze(1), 1)
-            #loss = criterion(outputs, target) 
-
+        if self.update_scheme.mse_loss:
+            target = torch.zeros_like(outputs)
+            target = target.scatter_(1, labels.unsqueeze(1), 1)
+            loss = criterion(outputs, target) 
+        else: 
             loss = criterion(outputs, labels) 
-            cur_losses[i] = loss
 
-        return torch.mean(cur_losses)
+        return loss
 
-    '''
-     Evaluate data X with correct labels y using model
-    '''
-    def evaluate(self, X, y, model):
-        
-        ac = [0] * self.m
-        total = [0] * self.m
-        with torch.no_grad():
-
-            correct = 0
-
-            outputs = model(X)
-            b = np.argmax(outputs, axis = 1)
-
-            for i in range(len(b)):
-                total[y[i]] += 1
-                if b[i] == y[i]:
-                    ac[y[i]] += 1
-
-            correct = torch.sum(y == b)
-            acc = correct*1.0/ sum(total)
-            print(correct, sum(total), acc)
-            
-            self.accuracies.append([ac[i] / total[i] for i in range(len(ac))])
-            
-            for i in range(self.m):
-                print("Acc of class", i, ":{0:.4f}".format(ac[i] / total[i]))
-        return acc
