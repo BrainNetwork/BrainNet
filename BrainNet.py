@@ -8,7 +8,7 @@ class BrainNet(nn.Module):
     # m = # of labels/classes
     # num_v = number of verices in graph
     # p = prob. of an edge in graph
-    def __init__(self, n, m, num_v, p, cap, rounds, gd_input = False, gd_output = False):
+    def __init__(self, n = 10, m = 2, num_v = 100, p = 0.5, cap = 50, rounds = 0, input_rule = False, full_gd = False, outlayer_connected = True, gd_input = True, gd_output = False):
         super().__init__()
 
         self.cap = cap
@@ -20,34 +20,38 @@ class BrainNet(nn.Module):
             
         self.activated = torch.zeros(self.num_v).long()
 
+        out_p = p
+        if outlayer_connected: 
+            out_p = 1
+
         # defines the graph
         self.input_layer = self.generate_input_layer(n, num_v, p)
         self.graph = self.generate_random_graph(num_v, p)
-        self.output_layer = self.generate_output_layer(m, num_v, 1)
+        self.output_layer = self.generate_output_layer(m, num_v, out_p)
         
-        self.edges = (self.graph > 0).nonzero()
-        self.output_edges = (self.output_layer > 0).nonzero()
-
-        # the weights/bias
-        self.init_input_weights = torch.rand(num_v, n)
-        self.init_graph_weights = torch.rand(num_v, num_v)
-        
-        if gd_input:
-            self.input_weights = nn.Parameter((torch.randn(num_v, n)))
-        else:
-            self.input_weights = torch.randn(num_v, n) 
-            
-        if gd_output:
-            self.output_weights = nn.Parameter(torch.randn(m, num_v))
+        if full_gd: 
+            self.graph_weights = nn.Parameter((torch.rand(num_v, num_v)) - 0.5)
+            self.output_weights = nn.Parameter((torch.rand(m, num_v)) - 0.5)
+            self.graph_bias = nn.Parameter((torch.rand(num_v)) - 0.5)
+            self.output_bias = nn.Parameter((torch.rand(m)) - 0.5)
+            self.input_weights = nn.Parameter((torch.rand(num_v, n)) - 0.5)
         else: 
-            self.output_weights = torch.randn(m, num_v)
+            if gd_input:
+                self.input_weights = nn.Parameter((torch.randn(num_v, n)))
+            else:
+                self.input_weights = torch.randn(num_v, n) 
             
-        self.graph_weights = torch.randn(num_v, num_v)
-        self.graph_bias = torch.zeros(num_v)
-        self.output_bias = torch.zeros(m)
+            if gd_output:
+                self.output_weights = nn.Parameter(torch.randn(m, num_v))
+            else: 
+                self.output_weights = torch.randn(m, num_v)
+            
+            self.graph_weights = torch.randn(num_v, num_v)
+            self.graph_bias = torch.zeros(num_v)
+            self.output_bias = torch.zeros(m)
         
     # Define the forward pass here.
-    def forward(self, x):
+    def forward_pass(self, x):
         self.activated_rounds = []
         self.activated = torch.zeros(self.num_v)
 
@@ -92,6 +96,7 @@ class BrainNet(nn.Module):
     def get_output(self, x):
         a =  torch.mm(x, (self.output_layer * self.output_weights).T)
         res = a + self.output_bias
+        #return res
         return F.softmax(res, dim=1)
 
     def step_once_graph(self, x):
@@ -105,31 +110,29 @@ class BrainNet(nn.Module):
     # only top nodes will fire.
     def get_cap(self, x):
         
-        topk, indices = torch.topk(x, self.cap, axis = 1)
-        res = torch.zeros_like(x)
-        res = res.scatter(1, indices, topk)
+        if self.cap != -1:
+            topk, indices = torch.topk(x, self.cap, axis = 1)
+            res = torch.zeros_like(x)
+            res = res.scatter(1, indices, topk)
 
-        try:
-            activated = torch.zeros_like(x).scatter(1, indices, 1)
-            self.activated = 2 * self.activated + activated.squeeze()
-            self.activated_rounds.append(activated.squeeze())
-        except Exception as e:
-            pass
+            try:
+                activated = torch.zeros_like(x).scatter(1, indices, 1)
+                self.activated = 2 * self.activated + activated.squeeze()
+                self.activated_rounds.append(activated.squeeze())
+            except Exception as e:
+                pass
             
-        return res
+            return res
+        else: # don't use cap. activate what is greater than 0 after ReLu 
+            try: 
+              indices_ = (x[0] > 0).nonzero().T
+              activated_ = torch.zeros_like(x).scatter(1, indices_, 1)
+              self.activated = 2 * self.activated + activated_.squeeze()
+            except Exception as e:
+                pass
 
-        '''
-        "Fire" if positive after ReLu 
-
-        try: 
-          indices_ = (x[0] > 0).nonzero().T
-          activated_ = torch.zeros_like(x).scatter(1, indices_, 1)
-          self.activated = 2 * self.activated + activated_.squeeze()
-        except Exception as e:
-            pass
-
-        return x
-        '''
+            return x
+        
 
     # Generate random unweighted directed graph with n nodes
     # each edge appears with probability p
@@ -163,3 +166,42 @@ class BrainNet(nn.Module):
 
         return adj
 
+
+from torch.autograd import Variable
+
+class BrainNetSequence(BrainNet): 
+    def __init__(self, n, m, num_v, p, cap, rounds, input_rule = False, full_gd = False, outlayer_connected = True, gd_output_only = False, gd_input = True, gd_output = False):
+        super().__init__(n, m, num_v, p, cap, rounds, input_rule=input_rule, full_gd=full_gd, outlayer_connected=True, gd_output_only=gd_output_only, gd_input=gd_input, gd_output=gd_output)
+        self.vocab_size = n;
+
+    def forward(self, inp, hidden): 
+        self.activated = torch.zeros(self.num_v)
+
+        inp = inp.double()
+        input_ = torch.mv(self.input_weights * self.input_layer, inp)        
+
+        for _ in range(self.rounds):
+            hidden_ = torch.mv((self.graph * self.graph_weights), hidden.double())
+            hidden = F.relu(input_ + hidden_ + self.graph_bias)
+            hidden = self.get_cap(hidden)
+
+        output = torch.mv(self.output_layer * self.output_weights, hidden) + self.output_bias
+        return F.softmax(output, dim=0), hidden
+    
+            
+    def initHidden(self):
+        return Variable(torch.zeros(self.num_v))
+
+    # only top nodes will fire.
+    def get_cap(self, x):
+        topk, indices = torch.topk(x, self.cap, axis = 0)
+        res = torch.zeros_like(x)
+        res = res.scatter(0, indices, topk)
+
+        try:
+            activated = torch.zeros_like(x).scatter(1, indices, 1)
+            self.activated = 2 * self.activated + activated.squeeze()
+        except Exception as e:
+            pass
+
+        return res
